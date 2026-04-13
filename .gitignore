@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.*
+*.env
+
+# AWS
+.aws/
+*.pem
+
+# Tokens / Secrets
+*TOKEN*
+*SECRET*
+*_TOKENS.json
+
+# Deploy artifacts
+*.zip
+deploy-zips/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
