@@ -129,7 +129,7 @@ async function loadDraftTemplates(dbPool, tenantId) {
   const { rows: defaults } = await dbPool.query(
     `SELECT id, template_key, subject, body, description, placeholders
      FROM governance.draft_templates
-     WHERE tenant_id = '__default_hv__' AND is_active = true
+     WHERE tenant_id = '__default__' AND is_active = true
      ORDER BY template_key`,
     []
   );
