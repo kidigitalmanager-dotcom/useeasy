@@ -2,8 +2,8 @@
  * UseEasy Pack Engine — Deterministic Rule Evaluator
  *
  * Evaluates classification rules stored in PostgreSQL against email context.
- * Rules are organized in "packs" per domain (e-commerce, real estate, etc.)
- * and loaded per-tenant based on their active pack keys.
+ * Rules are organized in "packs" per domain (13 industry verticals) and
+ * loaded per-tenant based on their active pack keys.
  *
  * Architecture:
  * - Rules are JSON condition trees with AND/OR/NOT logic
@@ -30,12 +30,21 @@
  * @returns {Array<PackRule>} Sorted by priority (P0 = highest)
  */
 async function loadPackRules(dbPool, tenantId) {
+  if (!dbPool) throw new Error('loadPackRules: dbPool is required');
+  if (!tenantId || typeof tenantId !== 'string') {
+    throw new Error('loadPackRules: tenantId must be a non-empty string');
+  }
+
   // Query governance.v_tenant_active_packs view
   // This view auto-appends 'global_core' to every tenant's pack list
   const { rows: tenantPacks } = await dbPool.query(
     `SELECT pack_key FROM governance.v_tenant_active_packs WHERE tenant_id = $1`,
     [tenantId]
   );
+
+  if (!tenantPacks || tenantPacks.length === 0) {
+    return []; // Tenant has no packs configured
+  }
 
   const packKeys = tenantPacks.map(r => r.pack_key);
 
@@ -102,6 +111,10 @@ function normalizeText(text) {
  * @returns {boolean}
  */
 function evaluateClause(ctx, clause) {
+  if (!clause || !clause.field || !clause.op) {
+    throw new Error(`evaluateClause: invalid clause — field and op are required`);
+  }
+
   const fieldValue = getField(ctx, clause.field);
 
   switch (clause.op) {
@@ -218,9 +231,19 @@ function evaluatePackRules(rules, emailContext) {
 }
 
 /**
- * Calculates confidence based on match quality.
- * Single high-priority match = high confidence.
- * Multiple conflicting matches = lower confidence → routes to LLM.
+ * Calculates confidence score based on match quality.
+ * Used to decide whether the Pack Engine result is sufficient
+ * or should be escalated to the LLM Judge for validation.
+ *
+ * Scoring logic:
+ *   - Single match:           0.95 (high confidence, skip LLM)
+ *   - Multiple, same key:     0.90 (rules agree, skip LLM)
+ *   - Multiple, conflicting:  0.70–0.85 (priority gap determines score)
+ *
+ * If score < CONFIDENCE_GATE (0.75), the LLM Judge is invoked downstream.
+ *
+ * @param {Array<object>} matches - Priority-sorted rule matches
+ * @returns {number} Confidence score between 0.0 and 0.95
  */
 function calculateConfidence(matches) {
   if (matches.length === 0) return 0;
@@ -228,14 +251,16 @@ function calculateConfidence(matches) {
 
   // Multiple matches — check if they agree on core key
   const coreKeys = new Set(matches.map(m => m.action?.coreKey));
-  if (coreKeys.size === 1) return 0.90; // All agree
+  if (coreKeys.size === 1) return 0.90; // All agree → high confidence
 
-  // Conflicting matches — confidence drops based on priority gap
+  // Conflicting matches — confidence scales with priority gap between
+  // the top two candidates. Larger gap = primary is more dominant.
   const primaryPriority = matches[0].priority;
   const secondaryPriority = matches[1].priority;
   const gap = secondaryPriority - primaryPriority;
 
-  return Math.min(0.85, 0.70 + gap * 0.05);
+  // Base 0.70 + up to 0.15 bonus for priority gap, capped at 0.85
+  return 0.70 + Math.min(gap * 0.05, 0.15);
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,8 @@ const https = require('https');
 
 const JWKS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const CLOCK_SKEW_SECONDS = 30;
+
+// Only allow expected algorithms — rejects 'none' and other attack vectors
 const ALLOWED_ALGORITHMS = new Set(['ES256', 'HS256']);
 
 // ---------------------------------------------------------------------------
@@ -41,6 +43,7 @@ let jwksCacheTimestamp = 0;
  *
  * @param {string} jwksUrl - JWKS endpoint URL
  * @returns {Promise<Map<string, object>>} Map of kid → JWK
+ * @throws {Error} If JWKS response is invalid or unreachable
  */
 async function getCachedJWKS(jwksUrl) {
   const now = Date.now();
@@ -50,9 +53,13 @@ async function getCachedJWKS(jwksUrl) {
   }
 
   const jwksResponse = await fetchJSON(jwksUrl);
-  const keyMap = new Map();
 
-  for (const key of jwksResponse.keys || []) {
+  if (!jwksResponse || !Array.isArray(jwksResponse.keys)) {
+    throw new Error('JWKS_INVALID_FORMAT: response missing keys array');
+  }
+
+  const keyMap = new Map();
+  for (const key of jwksResponse.keys) {
     if (key.kid) {
       keyMap.set(key.kid, key);
     }
@@ -70,19 +77,37 @@ async function getCachedJWKS(jwksUrl) {
 /**
  * Decodes a JWT header without verification.
  * Used to determine the algorithm before choosing verification strategy.
+ *
+ * @param {string} token - Full JWT string (header.payload.signature)
+ * @returns {object} Decoded header object (e.g., { alg: 'ES256', kid: '...' })
+ * @throws {Error} If header cannot be decoded
  */
 function decodeJwtHeader(token) {
-  const [headerB64] = token.split('.');
-  return JSON.parse(Buffer.from(headerB64, 'base64url').toString());
+  try {
+    const [headerB64] = token.split('.');
+    if (!headerB64) throw new Error('missing header segment');
+    return JSON.parse(Buffer.from(headerB64, 'base64url').toString());
+  } catch (err) {
+    throw new Error(`JWT_DECODE_ERROR: header — ${err.message}`);
+  }
 }
 
 /**
  * Decodes a JWT payload without verification.
  * Used to extract claims after signature is verified.
+ *
+ * @param {string} token - Full JWT string
+ * @returns {object} Decoded payload (claims)
+ * @throws {Error} If payload cannot be decoded
  */
 function decodeJwtPayload(token) {
-  const [, payloadB64] = token.split('.');
-  return JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
+  try {
+    const [, payloadB64] = token.split('.');
+    if (!payloadB64) throw new Error('missing payload segment');
+    return JSON.parse(Buffer.from(payloadB64, 'base64url').toString());
+  } catch (err) {
+    throw new Error(`JWT_DECODE_ERROR: payload — ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,22 +120,27 @@ function decodeJwtPayload(token) {
  * @param {string} token - Full JWT string
  * @param {object} jwk - JSON Web Key (from JWKS endpoint)
  * @returns {boolean} True if signature is valid
+ * @throws {Error} If key is malformed or verification fails unexpectedly
  */
 function verifyES256(token, jwk) {
-  const parts = token.split('.');
-  const signedContent = `${parts[0]}.${parts[1]}`;
-  const signature = Buffer.from(parts[2], 'base64url');
+  try {
+    const parts = token.split('.');
+    const signedContent = `${parts[0]}.${parts[1]}`;
+    const signature = Buffer.from(parts[2], 'base64url');
 
-  const keyObject = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+    const keyObject = crypto.createPublicKey({ key: jwk, format: 'jwk' });
 
-  const verifier = crypto.createVerify('SHA256');
-  verifier.update(signedContent);
+    const verifier = crypto.createVerify('SHA256');
+    verifier.update(signedContent);
 
-  // IEEE P1363 encoding for ECDSA (not DER) — required for JWT
-  return verifier.verify(
-    { key: keyObject, dsaEncoding: 'ieee-p1363' },
-    signature
-  );
+    // IEEE P1363 encoding for ECDSA (not DER) — required for JWT
+    return verifier.verify(
+      { key: keyObject, dsaEncoding: 'ieee-p1363' },
+      signature
+    );
+  } catch (err) {
+    throw new Error(`ES256_VERIFICATION_ERROR: ${err.message}`);
+  }
 }
 
 /**
@@ -131,10 +161,12 @@ function verifyHS256(token, secret) {
     .update(signedContent)
     .digest();
 
-  // Timing-safe comparison — prevents leaking signature bytes via timing
+  // Length check before timingSafeEqual (which requires equal lengths)
   if (providedSignature.length !== expectedSignature.length) {
     return false;
   }
+
+  // Timing-safe comparison — constant time regardless of byte position
   return crypto.timingSafeEqual(expectedSignature, providedSignature);
 }
 
@@ -146,21 +178,33 @@ function verifyHS256(token, secret) {
  * Verifies a Supabase JWT with dual-algorithm support.
  *
  * Flow:
- *   1. Decode header → determine algorithm
- *   2. Reject unexpected algorithms (security)
- *   3. ES256: fetch JWKS, verify with public key
- *   4. HS256: verify with shared secret (fallback)
- *   5. Validate expiry with clock skew tolerance
- *   6. Return decoded payload if valid
+ *   1. Validate inputs (token format, config object)
+ *   2. Decode header → determine algorithm
+ *   3. Reject unexpected algorithms (security)
+ *   4. ES256: fetch JWKS, verify with public key
+ *   5. HS256: verify with shared secret (fallback)
+ *   6. Validate expiry with clock skew tolerance
+ *   7. Return decoded payload if valid
  *
- * @param {string} token - JWT Bearer token
- * @param {object} config - { jwksUrl, hmacSecret }
- * @returns {Promise<object>} Decoded JWT payload
- * @throws {Error} If verification fails
+ * @param {string} token - JWT Bearer token (without "Bearer " prefix)
+ * @param {object} config - Verification configuration
+ * @param {string} config.jwksUrl - JWKS endpoint URL (required for ES256)
+ * @param {string} [config.hmacSecret] - HMAC shared secret (required for HS256)
+ * @returns {Promise<object>} Decoded and verified JWT payload
+ * @throws {Error} JWT_MISSING | JWT_MALFORMED | JWT_UNSUPPORTED_ALGORITHM |
+ *                 JWT_UNKNOWN_KEY_ID | JWT_INVALID_SIGNATURE | JWT_EXPIRED |
+ *                 JWT_NOT_YET_VALID | JWT_INVALID_CONFIG
  */
 async function verifySupabaseJWT(token, config) {
+  // Input validation
   if (!token || typeof token !== 'string') {
     throw new Error('JWT_MISSING');
+  }
+  if (!config || typeof config !== 'object') {
+    throw new Error('JWT_INVALID_CONFIG: config object is required');
+  }
+  if (!config.jwksUrl || typeof config.jwksUrl !== 'string') {
+    throw new Error('JWT_INVALID_CONFIG: jwksUrl is required');
   }
 
   const parts = token.split('.');
@@ -168,10 +212,10 @@ async function verifySupabaseJWT(token, config) {
     throw new Error('JWT_MALFORMED');
   }
 
-  // Step 1: Decode header
+  // Step 1: Decode header to determine algorithm
   const header = decodeJwtHeader(token);
 
-  // Step 2: Algorithm allowlist
+  // Step 2: Algorithm allowlist — reject alg:none, RS256, etc.
   if (!ALLOWED_ALGORITHMS.has(header.alg)) {
     throw new Error(`JWT_UNSUPPORTED_ALGORITHM: ${header.alg}`);
   }
@@ -183,7 +227,7 @@ async function verifySupabaseJWT(token, config) {
     const jwks = await getCachedJWKS(config.jwksUrl);
     const jwk = jwks.get(header.kid);
     if (!jwk) {
-      throw new Error('JWT_UNKNOWN_KEY_ID');
+      throw new Error(`JWT_UNKNOWN_KEY_ID: ${header.kid}`);
     }
     signatureValid = verifyES256(token, jwk);
   } else if (header.alg === 'HS256') {
@@ -197,7 +241,7 @@ async function verifySupabaseJWT(token, config) {
     throw new Error('JWT_INVALID_SIGNATURE');
   }
 
-  // Step 5: Validate expiry
+  // Step 5: Validate expiry with clock skew tolerance
   const payload = decodeJwtPayload(token);
   const now = Math.floor(Date.now() / 1000);
 
@@ -217,9 +261,21 @@ async function verifySupabaseJWT(token, config) {
 // Helper: HTTPS JSON Fetch (no dependencies)
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetches JSON from a URL using native HTTPS (no axios/node-fetch).
+ *
+ * @param {string} url - URL to fetch
+ * @returns {Promise<object>} Parsed JSON response
+ * @throws {Error} On HTTP error, timeout, or invalid JSON
+ */
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { timeout: 5000 }, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`JWKS_HTTP_ERROR: ${res.statusCode}`));
+        return;
+      }
+
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
@@ -229,7 +285,8 @@ function fetchJSON(url) {
           reject(new Error(`JWKS_PARSE_ERROR: ${e.message}`));
         }
       });
-    }).on('error', reject);
+    }).on('error', reject)
+      .on('timeout', function () { this.destroy(); reject(new Error('JWKS_TIMEOUT')); });
   });
 }
 

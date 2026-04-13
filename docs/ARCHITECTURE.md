@@ -2,7 +2,7 @@
 
 ## Overview
 
-UseEasy is a multi-tenant email classification platform built on AWS serverless infrastructure. It processes inbound emails through a deterministic-first pipeline, using LLM validation only when the deterministic engine's confidence falls below threshold. This hybrid approach achieves 99.6% accuracy while keeping LLM costs minimal.
+UseEasy is a multi-tenant email classification platform built on AWS serverless infrastructure, serving 13 industry verticals through a single codebase. It processes inbound emails through a deterministic-first pipeline, using LLM validation only when the deterministic engine's confidence falls below threshold. This hybrid approach achieves 99.6% accuracy while keeping LLM costs minimal.
 
 ## Design Principles
 
@@ -107,10 +107,20 @@ Risk escalation adds `manual_review` as a label AND resolves the category from r
 ### Gate 4: Pack Engine
 The deterministic rule engine evaluates conditions against the email context. Rules are stored as JSONB in PostgreSQL, supporting AND/OR/NOT logic trees with operators like `contains_any`, `regex_any`, `eq`, `exists`.
 
-131 active rules across 3 packs:
-- `ecom_core_v1` (13 rules) — E-commerce patterns
-- `hv_real_estate_v1` (24 rules) — Property management
-- `global_core` (1 rule) — Cross-domain patterns
+131 active rules across 13 industry packs:
+- `ecom_core_v1` — E-commerce (invoices, returns, orders, delivery)
+- `real_estate_core_v1` — Property management (rent, maintenance, leases)
+- `logistics_core_v1` — Logistics (shipping, tracking, warehouse)
+- `b2b_sales_core_v1` — B2B Sales (quotes, proposals, pipeline)
+- `coaching_core_v1` — Coaching (bookings, sessions, clients)
+- `hotel_core_v1` — Hotel (reservations, guest requests)
+- `telecom_core_v1` — Telecom (service orders, outages)
+- `education_core_v1` — Education (enrollment, courses)
+- `manufacturing_core_v1` — Manufacturing (POs, supply chain)
+- `marketing_core_v1` — Marketing (campaigns, reporting)
+- `finanzen_core_v1` — Finance (transactions, compliance)
+- `energie_core_v1` — Energy (meter readings, tariffs)
+- `global_core_v1` — Cross-domain (included in all verticals)
 
 ### Gate 5: Confidence Gate
 If the Pack Engine confidence is ≥ 0.75, the LLM is skipped entirely. This saves ~80% of LLM invocations.

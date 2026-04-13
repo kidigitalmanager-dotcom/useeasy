@@ -22,7 +22,7 @@ Inbound Email → PII Masking → Risk Escalation → Pack Engine (deterministic
 
 **Key metrics:**
 - **99.6% accuracy** across 2,730 production emails (bulk test)
-- **131 active pack rules** across 3 domains (e-commerce, real estate, global)
+- **131 active pack rules** across 13 industry verticals
 - **15 decision paths** with explicit routing logic
 - **Sub-200ms p95 latency** for deterministic classification
 
@@ -91,7 +91,7 @@ Gate 11: Audit + Improvement     → Full decision trace logged
 │           Tenant Resolution                   │
 │                                               │
 │  tenant_id ──► governance.tenants             │
-│                  ├── domain (ecom/real_estate) │
+│                  ├── domain (13 verticals)     │
 │                  └── active_pack_keys []       │
 │                                               │
 │  domain ──► Pack Rules loaded                 │
@@ -271,16 +271,27 @@ No Express. No frameworks. Pure Lambda handler.
 
 ---
 
-## Domain Coverage
+## Domain Coverage (13 Industry Verticals)
 
-### E-Commerce (13 rules)
-Invoice handling, return/refund workflows, order confirmations, delivery notifications, support tickets, AGB/privacy requests.
+UseEasy ships with pack rules for 12 industry verticals plus a global cross-domain pack. Each vertical has domain-specific classification rules, label names, and draft templates. New verticals can be added through configuration — no code changes required.
 
-### Real Estate / Property Management (24 rules)
-Utility billing, rent increases, deposit handling, water damage/mold, heating failures, elevator issues, tenant inquiries, lease management, terminations, handover protocols, maintenance coordination.
+### Configured Verticals
 
-### Global (1 rule)
-Cross-domain patterns that apply regardless of tenant domain.
+| Vertical | Pack Key | Focus Areas |
+|----------|----------|-------------|
+| **E-Commerce** | `ecom_core_v1` | Invoices, returns, order confirmations, delivery, support tickets |
+| **Real Estate** | `real_estate_core_v1` | Utility billing, rent, maintenance, lease management, tenant inquiries |
+| **Logistics** | `logistics_core_v1` | Shipping, tracking, warehouse, delivery scheduling |
+| **B2B Sales** | `b2b_sales_core_v1` | Quotes, proposals, contract negotiation, pipeline |
+| **Coaching** | `coaching_core_v1` | Bookings, session management, client communication |
+| **Hotel** | `hotel_core_v1` | Reservations, guest requests, check-in/out, billing |
+| **Telecom** | `telecom_core_v1` | Service orders, outages, billing disputes, contracts |
+| **Education** | `education_core_v1` | Enrollment, course admin, student inquiries, certificates |
+| **Manufacturing** | `manufacturing_core_v1` | Purchase orders, quality, supply chain, maintenance |
+| **Marketing** | `marketing_core_v1` | Campaign management, client reporting, brief handling |
+| **Finance** | `finanzen_core_v1` | Transactions, compliance, account management, audits |
+| **Energy** | `energie_core_v1` | Meter readings, tariff changes, grid inquiries, billing |
+| **Global** | `global_core_v1` | Cross-domain patterns (included in all verticals) |
 
 ---
 

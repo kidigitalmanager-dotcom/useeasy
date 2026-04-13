@@ -2,7 +2,7 @@
  * UseEasy Label Policy — Domain-Aware Label Resolution
  *
  * This module manages the mapping between internal core keys and
- * user-facing label names across different business domains.
+ * user-facing label names across different business domains (13 verticals).
  *
  * Design principle:
  *   Internal code ALWAYS uses immutable core keys (e.g., 'billing_payment').
@@ -52,8 +52,10 @@ const CORE_LABEL_BY_KEY = Object.freeze({
  * Each domain can override any or all label names.
  * Unknown domains fall back to 'default'.
  *
- * NOTE: Actual production values redacted.
- * The pattern shown here demonstrates the architecture.
+ * Production deployment covers 13 industry verticals — two shown here
+ * as examples. Additional domains (logistics, coaching, hotel, telecom,
+ * education, manufacturing, marketing, finance, energy, b2b_sales)
+ * follow the same pattern and are loaded from the database at runtime.
  */
 const DOMAIN_LABEL_DISPLAY = Object.freeze({
   default: {
@@ -66,7 +68,7 @@ const DOMAIN_LABEL_DISPLAY = Object.freeze({
     manual_review:      'Manual Review',
   },
 
-  // Example: Real estate domain uses different terminology
+  // Example: Real estate domain uses property management terminology
   real_estate: {
     billing_payment:    'Utility Billing & Payment',
     request_order:      'Tenant Inquiry & Request',
@@ -77,9 +79,21 @@ const DOMAIN_LABEL_DISPLAY = Object.freeze({
     manual_review:      'Manual Review',
   },
 
-  // Additional domains can be added without code changes
-  // Just insert a new key here — the pipeline handles the rest
+  // 11 additional domains configured in production (not shown).
+  // New domains can be added without code changes —
+  // just insert a new key here and the pipeline handles the rest.
 });
+
+// ---------------------------------------------------------------------------
+// Reverse Lookup (built once at module load for O(1) display→core resolution)
+// ---------------------------------------------------------------------------
+
+const DISPLAY_TO_CORE_KEY = Object.freeze(
+  Object.entries(DOMAIN_LABEL_DISPLAY.default).reduce(
+    (acc, [coreKey, displayName]) => ({ ...acc, [displayName]: coreKey }),
+    {}
+  )
+);
 
 // ---------------------------------------------------------------------------
 // Label Resolution Functions
@@ -88,8 +102,13 @@ const DOMAIN_LABEL_DISPLAY = Object.freeze({
 /**
  * Resolves the display name for a core key in a given domain.
  *
+ * Resolution order:
+ *   1. Domain-specific mapping (if domain is known)
+ *   2. Default domain mapping
+ *   3. Core key as-is (failsafe — should never happen with valid keys)
+ *
  * @param {string} coreKey - Internal core key (e.g., 'billing_payment')
- * @param {string} [domain] - Tenant domain (e.g., 'real_estate')
+ * @param {string} [domain] - Tenant domain (e.g., 'real_estate'). Defaults to 'default'.
  * @returns {string} Human-readable label name
  */
 function getLabelDisplayName(coreKey, domain) {
@@ -99,26 +118,25 @@ function getLabelDisplayName(coreKey, domain) {
 
 /**
  * Rewrites a single label for a specific domain.
- * Used internally by rewriteLabelsForDomain.
+ * Accepts both core keys and display names as input.
  *
- * @param {string} label - Label to rewrite (can be core key or display name)
+ * @param {string} label - Label to rewrite (core key or display name)
  * @param {string} domain - Target domain
  * @returns {string} Domain-specific display name
  */
 function rewriteLabelForDomain(label, domain) {
-  // Check if label is already a core key
+  // Direct core key lookup (most common path)
   if (CORE_LABEL_BY_KEY[label]) {
     return getLabelDisplayName(label, domain);
   }
 
-  // Check if label is a default display name → resolve to core key first
-  const defaultMap = DOMAIN_LABEL_DISPLAY.default;
-  const coreKey = Object.keys(defaultMap).find(k => defaultMap[k] === label);
+  // Reverse lookup: display name → core key → domain display name
+  const coreKey = DISPLAY_TO_CORE_KEY[label];
   if (coreKey) {
     return getLabelDisplayName(coreKey, domain);
   }
 
-  // Unknown label — return as-is
+  // Unknown label — return as-is (e.g., custom tenant labels)
   return label;
 }
 
@@ -157,11 +175,15 @@ function rewriteLabelsForDomain(labels, tenantDomain) {
  *
  * @param {object} decision - Classification decision
  * @param {string} decision.primaryKey - Primary core key
- * @param {string[]} decision.riskFlags - Risk escalation flags
- * @param {boolean} decision.candidatesOnly - Skip human review rules
+ * @param {string[]} [decision.riskFlags] - Risk escalation flags
+ * @param {boolean} [decision.candidatesOnly] - Skip human review rules
  * @returns {string[]} Final core keys (max 2)
  */
 function resolveDualLabels(decision) {
+  if (!decision || typeof decision !== 'object') {
+    return [];
+  }
+
   const labels = new Set();
 
   // Always add primary
@@ -190,19 +212,71 @@ function resolveDualLabels(decision) {
   return sorted.slice(0, 2);
 }
 
+// ---------------------------------------------------------------------------
+// Risk Flag → Category Resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Priority-based mapping from risk escalation triggers to core keys.
+ * More specific triggers map to more specific categories.
+ * When multiple flags are present, the most specific one wins.
+ */
+const TRIGGER_TO_CORE_KEY = Object.freeze({
+  legal_threat:       'contract_legal',
+  contract_dispute:   'contract_legal',
+  gdpr_request:       'contract_legal',
+  billing_dispute:    'billing_payment',
+  payment_fraud:      'billing_payment',
+  refund_escalation:  'returns_refund',
+  chargeback:         'returns_refund',
+  service_outage:     'support_issue',
+  complaint:          'support_issue',
+  delivery_failure:   'status_fulfillment',
+});
+
+/**
+ * Specificity scores for conflict resolution.
+ * Higher score = more specific category = wins over generic ones.
+ */
+const CORE_KEY_SPECIFICITY = Object.freeze({
+  contract_legal:     90,
+  billing_payment:    80,
+  returns_refund:     70,
+  support_issue:      60,
+  status_fulfillment: 50,
+  request_order:      40,
+  manual_review:      10,
+});
+
 /**
  * Resolves a category core key from risk escalation flags.
  * Uses TRIGGER_TO_CORE_KEY mapping with specificity ranking —
  * more specific categories win over generic ones.
  *
- * Example: If both 'contract' and 'support' flags are present,
- * 'contract_legal' wins because it's more specific (higher specificity score).
+ * Example: If both 'legal_threat' and 'complaint' flags are present,
+ * 'contract_legal' wins (specificity 90) over 'support_issue' (specificity 60).
+ *
+ * @param {string[]} flags - Risk escalation trigger flags
+ * @returns {string|null} Most specific category core key, or null
  */
 function resolveCategoryFromFlags(flags) {
-  // Implementation uses TRIGGER_TO_CORE_KEY + CORE_KEY_SPECIFICITY
-  // maps — details omitted (business logic).
-  // Pattern: flags.map(f => TRIGGER_TO_CORE_KEY[f]).sort(bySpecificity)[0]
-  return null; // Placeholder
+  if (!Array.isArray(flags) || flags.length === 0) {
+    return null;
+  }
+
+  // Map flags to core keys, filter unknown flags
+  const candidates = flags
+    .map(flag => TRIGGER_TO_CORE_KEY[flag])
+    .filter(Boolean);
+
+  if (candidates.length === 0) return null;
+
+  // Sort by specificity (descending) — most specific wins
+  candidates.sort((a, b) =>
+    (CORE_KEY_SPECIFICITY[b] || 0) - (CORE_KEY_SPECIFICITY[a] || 0)
+  );
+
+  return candidates[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -234,5 +308,6 @@ module.exports = {
   rewriteLabelForDomain,
   rewriteLabelsForDomain,
   resolveDualLabels,
+  resolveCategoryFromFlags,
   toOutlookCategory,
 };

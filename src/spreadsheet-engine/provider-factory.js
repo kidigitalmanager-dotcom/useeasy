@@ -2,8 +2,9 @@
  * UseEasy Spreadsheet Engine — Provider-Agnostic Abstraction Layer
  *
  * Unified interface for Google Sheets, Microsoft Graph (OneDrive/SharePoint),
- * and local Excel files. The classification pipeline interacts with spreadsheets
- * through this layer — it never knows which provider is backing the data.
+ * and local Excel files across 13 industry verticals. The classification pipeline
+ * interacts with spreadsheets through this layer — it never knows which
+ * provider is backing the data.
  *
  * Design:
  * - Factory pattern creates the right provider from tenant config
@@ -200,16 +201,73 @@ class GoogleSheetsProvider extends BaseSpreadsheetProvider {
     return diffs;
   }
 
-  // --- Internal helpers (HTTP, matching) omitted for brevity ---
+  // --- Internal helpers ---
 
+  /**
+   * Native HTTPS fetch with Bearer auth (no axios/node-fetch dependency).
+   * @private
+   */
   async _fetch(url, accessToken, method = 'GET', body = null) {
-    // Native HTTPS fetch with Bearer auth
-    // Implementation uses Node.js https module — no axios/node-fetch
-    return {}; // Placeholder
+    const https = require('https');
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            reject(new Error(`Sheets API ${res.statusCode}: ${data.substring(0, 200)}`));
+            return;
+          }
+          resolve(data ? JSON.parse(data) : {});
+        });
+      });
+
+      req.on('error', reject);
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
   }
 
-  async _getAllRows(config) { return []; }
-  _matchRows(rows, criteria, mappings) { return []; }
+  /** Fetches all data rows (excluding header). @private */
+  async _getAllRows(config) {
+    const { spreadsheetId, sheetName, accessToken } = config;
+    const range = `${sheetName || 'Sheet1'}!A:ZZ`;
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}`;
+    const response = await this._fetch(url, accessToken);
+    const rows = response.values || [];
+    // First row is header — return rest as data rows
+    return rows.length > 1 ? rows.slice(1) : [];
+  }
+
+  /** Matches rows against criteria using semantic column mappings. @private */
+  _matchRows(rows, criteria, mappings) {
+    return rows
+      .map((row, index) => {
+        let score = 0;
+        for (const [field, colIndex] of Object.entries(mappings)) {
+          if (criteria[field] && row[colIndex.columnIndex]) {
+            const cellValue = String(row[colIndex.columnIndex]).toLowerCase();
+            const searchValue = String(criteria[field]).toLowerCase();
+            if (cellValue.includes(searchValue)) score += 1;
+          }
+        }
+        return { rowIndex: index, row, score };
+      })
+      .filter(m => m.score > 0)
+      .sort((a, b) => b.score - a.score);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +320,68 @@ class MicrosoftGraphProvider extends BaseSpreadsheetProvider {
     return { success: true };
   }
 
-  // --- Internal helpers omitted ---
+  // --- Internal helpers ---
 
-  async _graphFetch(url, accessToken, method = 'GET', body = null) { return {}; }
-  async _getUsedRange(config) { return []; }
-  _matchRows(rows, criteria, mappings) { return []; }
+  /** Native HTTPS fetch for Microsoft Graph API. @private */
+  async _graphFetch(url, accessToken, method = 'GET', body = null) {
+    const https = require('https');
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000,
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          if (res.statusCode >= 400) {
+            reject(new Error(`Graph API ${res.statusCode}: ${data.substring(0, 200)}`));
+            return;
+          }
+          resolve(data ? JSON.parse(data) : {});
+        });
+      });
+
+      req.on('error', reject);
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
+  }
+
+  /** Fetches the used range (all data) from a worksheet. @private */
+  async _getUsedRange(config) {
+    const { itemId, sheetName, accessToken } = config;
+    const url = `https://graph.microsoft.com/v1.0/me/drive/items/${itemId}/workbook/worksheets('${sheetName || 'Sheet1'}')/usedRange`;
+    const response = await this._graphFetch(url, accessToken);
+    const rows = response.values || [];
+    return rows.length > 1 ? rows.slice(1) : []; // Skip header row
+  }
+
+  /** Matches rows against criteria using semantic column mappings. @private */
+  _matchRows(rows, criteria, mappings) {
+    return rows
+      .map((row, index) => {
+        let score = 0;
+        for (const [field, colIndex] of Object.entries(mappings)) {
+          if (criteria[field] && row[colIndex.columnIndex]) {
+            const cellValue = String(row[colIndex.columnIndex]).toLowerCase();
+            const searchValue = String(criteria[field]).toLowerCase();
+            if (cellValue.includes(searchValue)) score += 1;
+          }
+        }
+        return { rowIndex: index, row, score };
+      })
+      .filter(m => m.score > 0)
+      .sort((a, b) => b.score - a.score);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +420,24 @@ class LocalExcelProvider extends BaseSpreadsheetProvider {
     return this._matchRows(rows, criteria, mappings);
   }
 
-  _matchRows(rows, criteria, mappings) { return []; }
+  /** Matches rows against criteria using header-based column mappings. @private */
+  _matchRows(rows, criteria, mappings) {
+    return rows
+      .map((row, index) => {
+        let score = 0;
+        for (const [field, mapping] of Object.entries(mappings)) {
+          const headerName = mapping.headerName;
+          if (criteria[field] && row[headerName]) {
+            const cellValue = String(row[headerName]).toLowerCase();
+            const searchValue = String(criteria[field]).toLowerCase();
+            if (cellValue.includes(searchValue)) score += 1;
+          }
+        }
+        return { rowIndex: index, row, score };
+      })
+      .filter(m => m.score > 0)
+      .sort((a, b) => b.score - a.score);
+  }
 }
 
 // ---------------------------------------------------------------------------
